@@ -8,6 +8,9 @@ import seaborn as sns
 from adjustText import adjust_text
 
 API_KEY = os.environ["CENSUS_API_KEY"]
+HOME = os.path.expanduser("~")
+DB_PATH = os.path.join(HOME, "tx-voter-eligibility.db")
+CHART_PATH = os.path.join(HOME, "tx-voter-scatter.png")
 
 url = "http://api.census.gov/data/2023/acs/acs5"
 params = {
@@ -45,7 +48,7 @@ sos_response = requests.get(sos_url)
 sos_tables = pd.read_html(io.StringIO(sos_response.text))
 vr = sos_tables[0]
 
-conn = sqlite3.connect("/Users/dakotagr98/tx-voter-eligibility.db")
+conn = sqlite3.connect("DB_PATH")
 cursor = conn.cursor()
 
 cursor.execute("""
@@ -178,7 +181,7 @@ query_all = """
     FROM registration_gap
 """
 
-conn2 = sqlite3.connect("/Users/dakotagr98/tx-voter-eligibility.db")
+conn2 = sqlite3.connect("DB_PATH")
 plot_df = pd.read_sql_query(query_all, conn2)
 conn2.close()
 
@@ -257,5 +260,5 @@ sources = (
 )
 plt.figtext(0.5, -0.03, sources, ha="center", fontsize=6, color="gray", wrap=True)
 plt.tight_layout()
-plt.savefig("/Users/dakotagr98/tx-voter-scatter.png", dpi=150, bbox_inches="tight")
+plt.savefig(CHART_PATH, dpi=150, bbox_inches="tight")
 print("Chart saved.")
