@@ -1,16 +1,35 @@
 import sqlite3
 import os
+import ast
 import requests
 import pandas as pd
 import io
 import matplotlib.pyplot as plt
 import seaborn as sns
+import anthropic
 from adjustText import adjust_text
 
 API_KEY = os.environ["CENSUS_API_KEY"]
 HOME = os.path.expanduser("~")
 DB_PATH = os.path.join(HOME, "tx-voter-eligibility.db")
 CHART_PATH = os.path.join(HOME, "tx-voter-scatter.png")
+
+client = anthropic.Anthropic()
+
+tdcj_response = requests.get("https://www.tdcj.texas.gov/unit_directory/")
+raw_text = tdcj_response.text
+
+message = client.messages.create(
+    model="claude-opus-4-7",
+    max_tokens=1024,
+    messages=[{
+        "role": "user",
+        "content": f"Extract all prison unit names and their Texas counties from this HTML. Return ONLY a Python list of tuples with no explanation, no markdown, no code fences: [(unit_name, county_name), ...]. HTML: {raw_text[:10000]}"
+    }]
+)
+
+raw_pairs = ast.literal_eval(message.content[0].text.strip())
+prison_counties = {f"{county} County, Texas" for _, county in raw_pairs}
 
 url = "http://api.census.gov/data/2023/acs/acs5"
 params = {
@@ -160,6 +179,17 @@ null_discharges = conn.execute("""
 """).fetchone()[0]
 print(f"NULL jail discharges:  {null_discharges}%")
 
+high_null_counties = conn.execute("""
+    SELECT COUNT(*) FROM (
+        SELECT fips,
+               100.0 * SUM(CASE WHEN total_jail_discharges IS NULL THEN 1 ELSE 0 END) / COUNT(*) AS null_rate
+        FROM releases
+        GROUP BY fips
+        HAVING null_rate > 50
+    )
+""").fetchone()[0]
+print(f"Counties >50% NULL discharges: {high_null_counties}")
+
 dupes = conn.execute("""
     SELECT COUNT(*) FROM (
         SELECT fips FROM counties GROUP BY fips HAVING COUNT(*) > 1
@@ -205,18 +235,26 @@ query_all = """
         FROM releases
         GROUP BY fips
     ),
+    null_rates AS (
+        SELECT fips,
+               100.0 * SUM(CASE WHEN total_jail_discharges IS NULL THEN 1 ELSE 0 END) / COUNT(*) AS null_rate
+        FROM releases
+        GROUP BY fips
+    ),
     registration_gap AS (
         SELECT
             c.county_name,
             c.cvap,
             vr.registered_voters,
             jh.total_discharges,
+            nr.null_rate,
             ROUND(vr.registered_voters * 100.0 / c.cvap, 1) AS registration_rate
         FROM counties c
         JOIN voter_registration vr ON c.fips = vr.fips
         JOIN jail_history jh ON c.fips = jh.fips
+        JOIN null_rates nr ON c.fips = nr.fips
     )
-    SELECT county_name, registration_rate, total_discharges
+    SELECT county_name, registration_rate, total_discharges, null_rate
     FROM registration_gap
 """
 
@@ -224,31 +262,9 @@ conn2 = sqlite3.connect(DB_PATH)
 plot_df = pd.read_sql_query(query_all, conn2)
 conn2.close()
 
-prison_counties = {
-    "Anderson County, Texas", "Angelina County, Texas", "Bee County, Texas",
-    "Bexar County, Texas", "Bowie County, Texas", "Brazoria County, Texas",
-    "Brazos County, Texas", "Brown County, Texas", "Burnet County, Texas",
-    "Caldwell County, Texas", "Cherokee County, Texas", "Childress County, Texas",
-    "Coryell County, Texas", "Dallas County, Texas", "Dawson County, Texas",
-    "DeWitt County, Texas", "Duvall County, Texas", "El Paso County, Texas",
-    "Falls County, Texas", "Fort Bend County, Texas", "Freestone County, Texas",
-    "Frio County, Texas", "Galveston County, Texas", "Garza County, Texas",
-    "Gray County, Texas", "Grimes County, Texas", "Hale County, Texas",
-    "Harris County, Texas", "Hartley County, Texas", "Hays County, Texas",
-    "Hidalgo County, Texas", "Houston County, Texas", "Jack County, Texas",
-    "Jasper County, Texas", "Jefferson County, Texas", "Johnson County, Texas",
-    "Jones County, Texas", "Karnes County, Texas", "La Salle County, Texas",
-    "Liberty County, Texas", "Lubbock County, Texas", "Madison County, Texas",
-    "Medina County, Texas", "Mitchell County, Texas", "Pecos County, Texas",
-    "Polk County, Texas", "Potter County, Texas", "Rusk County, Texas",
-    "San Saba County, Texas", "Scurry County, Texas", "Stephens County, Texas",
-    "Swisher County, Texas", "Travis County, Texas", "Tyler County, Texas",
-    "Walker County, Texas", "Willacy County, Texas", "Williamson County, Texas",
-    "Wise County, Texas", "Wichita County, Texas", "Wood County, Texas",
-}
 
 plot_df["has_prison"] = plot_df["county_name"].isin(prison_counties)
-
+plot_df["sparse_data"] = plot_df["null_rate"] > 50
 
 plt.figure(figsize=(12, 7))
 ax = sns.scatterplot(
@@ -267,6 +283,17 @@ sns.scatterplot(
     alpha=0.7,
     ax=ax,
     label="Has TDCJ prison unit"
+)
+sns.scatterplot(
+    data=plot_df[plot_df["sparse_data"]],
+    x="total_discharges",
+    y="registration_rate",
+    color="black",
+    alpha=0.9,
+    marker="x",
+    s=60,
+    ax=ax,
+    label=">50% missing discharge data"
 )
 ax.legend(loc="upper left", fontsize=8)
 
