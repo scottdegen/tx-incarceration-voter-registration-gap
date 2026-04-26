@@ -48,7 +48,7 @@ sos_response = requests.get(sos_url)
 sos_tables = pd.read_html(io.StringIO(sos_response.text))
 vr = sos_tables[0]
 
-conn = sqlite3.connect("DB_PATH")
+conn = sqlite3.connect(DB_PATH)
 cursor = conn.cursor()
 
 cursor.execute("""
@@ -114,11 +114,11 @@ for _, row in tx.iterrows():
 
 county_name_to_fips = {}
 for row in conn.execute("SELECT fips, county_name FROM counties"):
-    name = row[1].replace(" County, Texas", "").upper()
+    name = row[1].replace(" County, Texas", "").upper().replace(" ", "")
     county_name_to_fips[name] = row[0]
 
 for _, row in vr.iterrows():
-    name = str(row["County Name"]).upper().strip()
+    name = str(row["County Name"]).upper().strip().replace(" ", "")
     fips = county_name_to_fips.get(name)
     if fips is None:
         continue
@@ -129,6 +129,45 @@ for _, row in vr.iterrows():
     )
 
 conn.commit()
+
+print("\n=== DATA VALIDATION ===")
+
+checks = {}
+
+checks["counties_count"] = conn.execute("SELECT COUNT(*) FROM counties").fetchone()[0]
+checks["releases_count"] = conn.execute("SELECT COUNT(*) FROM releases").fetchone()[0]
+checks["voter_reg_count"] = conn.execute("SELECT COUNT(*) FROM voter_registration").fetchone()[0]
+
+print(f"Counties loaded:       {checks['counties_count']} (expected 254)")
+print(f"Release records:       {checks['releases_count']}")
+print(f"Voter reg records:     {checks['voter_reg_count']} (expected 253-254)")
+
+bad_fips = conn.execute("""
+    SELECT COUNT(*) FROM counties
+    WHERE LENGTH(fips) != 5 OR fips NOT LIKE '48%'
+""").fetchone()[0]
+print(f"Malformed FIPS codes:  {bad_fips} (expected 0)")
+
+bad_cvap = conn.execute("""
+    SELECT COUNT(*) FROM counties
+    WHERE cvap > population
+""").fetchone()[0]
+print(f"CVAP > population:     {bad_cvap} (expected 0)")
+
+null_discharges = conn.execute("""
+    SELECT ROUND(100.0 * SUM(CASE WHEN total_jail_discharges IS NULL THEN 1 ELSE 0 END) / COUNT(*), 1)
+    FROM releases
+""").fetchone()[0]
+print(f"NULL jail discharges:  {null_discharges}%")
+
+dupes = conn.execute("""
+    SELECT COUNT(*) FROM (
+        SELECT fips FROM counties GROUP BY fips HAVING COUNT(*) > 1
+    )
+""").fetchone()[0]
+print(f"Duplicate FIPS:        {dupes} (expected 0)")
+
+print("=== END VALIDATION ===\n")
 
 query = """
     WITH jail_history AS (
@@ -181,7 +220,7 @@ query_all = """
     FROM registration_gap
 """
 
-conn2 = sqlite3.connect("DB_PATH")
+conn2 = sqlite3.connect(DB_PATH)
 plot_df = pd.read_sql_query(query_all, conn2)
 conn2.close()
 
