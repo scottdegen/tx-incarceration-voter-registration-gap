@@ -25,10 +25,10 @@ raw_text = tdcj_response.text
 
 message = client.messages.create(
     model="claude-opus-4-7",
-    max_tokens=1024,
+    max_tokens=4096,
     messages=[{
         "role": "user",
-        "content": f"Extract all prison unit names and their Texas counties from this HTML. Return ONLY a Python list of tuples with no explanation, no markdown, no code fences: [(unit_name, county_name), ...]. HTML: {raw_text[:10000]}"
+        "content": f"Extract all prison unit names and their Texas counties from this HTML. Return ONLY a Python list of tuples with no explanation, no markdown, no code fences: [(unit_name, county_name), ...]. HTML: {raw_text[:80000]}"
     }]
 )
 
