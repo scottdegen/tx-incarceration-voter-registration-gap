@@ -13,6 +13,7 @@ API_KEY = os.environ["CENSUS_API_KEY"]
 HOME = os.path.expanduser("~")
 DB_PATH = os.path.join(HOME, "tx-voter-eligibility.db")
 CHART_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tx-voter-scatter.png")
+FUNNEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tx-civic-funnel.png")
 
 # --- LLM-based TDCJ prison county extraction ---
 # Instead of hardcoding county names, we fetch the live TDCJ unit directory
@@ -85,6 +86,47 @@ sos_response = requests.get(sos_url)
 sos_tables = pd.read_html(io.StringIO(sos_response.text))
 vr = sos_tables[0]
 
+# --- Texas SOS county-level Nov 2022 turnout (closest major election to Jan 2023 registration snapshot) ---
+# Each county has its own historical page at /elections/historical/<county>.shtml with a
+# YEAR / Reg Voters / Voted table. We scrape all 254 and filter to the 2022 row.
+sos_counties_url = "https://www.sos.state.tx.us/elections/historical/counties.shtml"
+_counties_page = requests.get(sos_counties_url)
+
+from html.parser import HTMLParser as _HTMLParser
+class _LinkParser(_HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self._href = None
+        self.links = []
+    def handle_starttag(self, tag, attrs):
+        if tag == "a":
+            for k, v in attrs:
+                if k == "href":
+                    self._href = v
+    def handle_data(self, data):
+        if self._href and data.strip():
+            self.links.append((self._href, data.strip()))
+            self._href = None
+
+_lp = _LinkParser()
+_lp.feed(_counties_page.text)
+_county_slugs = [(href, name) for href, name in _lp.links
+                 if href.endswith(".shtml") and "/" not in href and href != "counties.shtml"]
+
+_sos_base = "https://www.sos.state.tx.us/elections/historical/"
+_turnout_rows = []
+for slug, county_name in _county_slugs:
+    try:
+        _r = requests.get(_sos_base + slug, timeout=10)
+        _t = pd.read_html(io.StringIO(_r.text))[0]
+        _row = _t[_t["YEAR"] == 2022]
+        if not _row.empty:
+            _turnout_rows.append({"county": county_name, "ballots_cast": _row["Voted"].values[0]})
+    except Exception:
+        pass
+
+ballot_tx = pd.DataFrame(_turnout_rows)
+
 # --- Database setup ---
 conn = sqlite3.connect(DB_PATH)
 cursor = conn.cursor()
@@ -125,6 +167,15 @@ cursor.execute("""
        year                 INTEGER,
        registered_voters    INTEGER,
        UNIQUE(fips, year)
+    )
+""")
+
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS voter_turnout (
+        fips          TEXT,
+        year          INTEGER,
+        ballots_cast  INTEGER,
+        UNIQUE(fips, year)
     )
 """)
 
@@ -178,6 +229,17 @@ for _, row in vr.iterrows():
         (fips, 2023, registered)
     )
 
+# OpenElections county names are bare (e.g. "Anderson") — same normalization as SOS
+for _, row in ballot_tx.iterrows():
+    name = str(row["county"]).upper().strip().replace(" ", "")
+    fips = county_name_to_fips.get(name)
+    if fips is None:
+        continue
+    cursor.execute(
+        "INSERT OR IGNORE INTO voter_turnout (fips, year, ballots_cast) VALUES (?, ?, ?)",
+        (fips, 2022, int(row["ballots_cast"]))
+    )
+
 conn.commit()
 
 # --- Data validation ---
@@ -188,10 +250,12 @@ checks = {}
 checks["counties_count"] = conn.execute("SELECT COUNT(*) FROM counties").fetchone()[0]
 checks["releases_count"] = conn.execute("SELECT COUNT(*) FROM releases").fetchone()[0]
 checks["voter_reg_count"] = conn.execute("SELECT COUNT(*) FROM voter_registration").fetchone()[0]
+checks["turnout_count"] = conn.execute("SELECT COUNT(*) FROM voter_turnout").fetchone()[0]
 
 print(f"Counties loaded:       {checks['counties_count']} (expected 254)")
 print(f"Release records:       {checks['releases_count']}")
 print(f"Voter reg records:     {checks['voter_reg_count']} (expected 253-254)")
+print(f"Turnout records:       {checks['turnout_count']} (expected ~254)")
 
 bad_fips = conn.execute("""
     SELECT COUNT(*) FROM counties
@@ -359,4 +423,54 @@ sources = (
 plt.figtext(0.5, -0.03, sources, ha="center", fontsize=6, color="gray", wrap=True)
 plt.tight_layout()
 plt.savefig(CHART_PATH, dpi=150, bbox_inches="tight")
-print("Chart saved.")
+print("Scatter chart saved.")
+
+# --- Civic participation funnel: CVAP → Registration → Turnout ---
+funnel_query = """
+    SELECT
+        c.county_name,
+        c.cvap,
+        vr.registered_voters,
+        vt.ballots_cast,
+        ROUND(vr.registered_voters * 100.0 / c.cvap, 1)        AS registration_rate,
+        ROUND(vt.ballots_cast * 100.0 / vr.registered_voters, 1) AS turnout_rate,
+        ROUND(vt.ballots_cast * 100.0 / c.cvap, 1)             AS participation_rate
+    FROM counties c
+    JOIN voter_registration vr ON c.fips = vr.fips
+    JOIN voter_turnout vt      ON c.fips = vt.fips
+"""
+
+conn3 = sqlite3.connect(DB_PATH)
+funnel_df = pd.read_sql_query(funnel_query, conn3)
+conn3.close()
+
+funnel_df["has_prison"] = funnel_df["county_name"].isin(prison_counties)
+
+fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+
+panels = [
+    ("cvap",              "registration_rate", "CVAP",              "Registration Rate (% of CVAP)",         "Who could register → Who did register"),
+    ("registered_voters", "turnout_rate",      "Registered Voters", "Turnout Rate (% of registered voters)", "Who registered → Who voted"),
+    ("cvap",              "participation_rate","CVAP",              "Participation Rate (% of CVAP)",         "Who could register → Who voted"),
+]
+
+for ax, (x_col, y_col, x_label, y_label, title) in zip(axes, panels):
+    sns.scatterplot(data=funnel_df[~funnel_df["has_prison"]], x=x_col, y=y_col,
+                    color="steelblue", alpha=0.6, label="No TDCJ unit", ax=ax)
+    sns.scatterplot(data=funnel_df[funnel_df["has_prison"]], x=x_col, y=y_col,
+                    color="red", alpha=0.7, label="Has TDCJ unit", ax=ax)
+    ax.set_xscale("log")
+    ax.set_xlabel(x_label, fontsize=9)
+    ax.set_ylabel(y_label, fontsize=9)
+    ax.set_title(title, fontsize=10)
+    ax.legend(fontsize=7)
+
+funnel_sources = (
+    "Sources: Census ACS 2023 (CVAP) | TX SOS Voter Registration Jan 2023 | "
+    "TX SOS County Historical Election Results Nov 2022 (ballots cast) | TDCJ Unit Directory"
+)
+plt.suptitle("Texas County Civic Participation Funnel", fontsize=13, y=1.01)
+plt.figtext(0.5, -0.02, funnel_sources, ha="center", fontsize=6, color="gray")
+plt.tight_layout()
+plt.savefig(FUNNEL_PATH, dpi=150, bbox_inches="tight")
+print("Funnel chart saved.")
