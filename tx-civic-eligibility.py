@@ -12,7 +12,7 @@ from adjustText import adjust_text
 API_KEY = os.environ["CENSUS_API_KEY"]
 HOME = os.path.expanduser("~")
 DB_PATH = os.path.join(HOME, "tx-voter-eligibility.db")
-CHART_PATH = os.path.join(HOME, "tx-voter-scatter.png")
+CHART_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tx-voter-scatter.png")
 
 # --- LLM-based TDCJ prison county extraction ---
 # Instead of hardcoding county names, we fetch the live TDCJ unit directory
@@ -103,7 +103,8 @@ cursor.execute("""
         fips                   TEXT,
         year                   INTEGER,
         total_jail_discharges  INTEGER,
-        total_prison_pop       INTEGER
+        total_prison_pop       INTEGER,
+        UNIQUE(fips, year)
     )
 """)
 
